@@ -32,12 +32,15 @@ struct Args {
     flavor: String,
     timeout_seconds: u64,
     mesh_llm_ref: String,
+    source_revision: String,
+    target_repo: Option<String>,
     retry_queued_after: Duration,
     split_candidate_vram_bytes: u64,
     quant_preference: Vec<String>,
     wait_for_jobs: bool,
     job_poll_interval: Duration,
     catalog_direct: bool,
+    force: bool,
     confirm: bool,
     dry_run: bool,
 }
@@ -193,7 +196,11 @@ async fn main() -> Result<()> {
             );
             continue;
         }
-        let status = candidate_status(&hf_client, &candidate, args.retry_queued_after).await?;
+        let status = if args.force {
+            QueueStatus::Missing
+        } else {
+            candidate_status(&hf_client, &candidate, args.retry_queued_after).await?
+        };
         match status {
             QueueStatus::Published { repo } => {
                 println!(
@@ -317,6 +324,8 @@ impl Args {
             flavor: "auto".to_string(),
             timeout_seconds: parse_duration_seconds("1h")?,
             mesh_llm_ref: "main".to_string(),
+            source_revision: "main".to_string(),
+            target_repo: None,
             retry_queued_after: Duration::from_secs(30 * 60 * 60),
             split_candidate_vram_bytes: DEFAULT_SPLIT_CANDIDATE_VRAM_BYTES,
             quant_preference: DEFAULT_QUANT_PREFERENCE
@@ -326,6 +335,7 @@ impl Args {
             wait_for_jobs: false,
             job_poll_interval: Duration::from_secs(60),
             catalog_direct: true,
+            force: false,
             confirm: false,
             dry_run: true,
         };
@@ -346,6 +356,8 @@ impl Args {
                     args.timeout_seconds = parse_duration_seconds(&next_value(&mut iter, &flag)?)?
                 }
                 "--mesh-llm-ref" => args.mesh_llm_ref = next_value(&mut iter, &flag)?,
+                "--source-revision" => args.source_revision = next_value(&mut iter, &flag)?,
+                "--target-repo" => args.target_repo = Some(next_value(&mut iter, &flag)?),
                 "--retry-queued-after-hours" => {
                     let hours: u64 = parse_next(&mut iter, &flag)?;
                     args.retry_queued_after = Duration::from_secs(hours * 60 * 60);
@@ -376,6 +388,7 @@ impl Args {
                 }
                 "--catalog-direct" => args.catalog_direct = true,
                 "--no-catalog-direct" => args.catalog_direct = false,
+                "--force" => args.force = true,
                 "--confirm" => {
                     args.confirm = true;
                     args.dry_run = false;
@@ -428,6 +441,8 @@ fn print_help() {
            --confirm\n\
            --dry-run\n\
            --mesh-llm-ref REF\n\
+           --source-revision REV\n\
+           --target-repo OWNER/REPO\n\
            --quant-preference CSV\n\
            --recent-limit N\n\
            --popular-limit N\n\
@@ -438,6 +453,7 @@ fn print_help() {
            --wait-for-jobs\n\
            --job-poll-seconds N\n\
            --split-candidate-vram-gib GiB\n\
+           --force\n\
            --no-catalog-direct"
     );
 }
@@ -668,8 +684,14 @@ async fn build_candidate(
         return Ok(None);
     }
 
-    let target_repo = layer_target_repo(&quant, &args.target_namespace);
-    let model_layer_repos = model_layer_repos(&quants, &args.target_namespace);
+    let target_repo = args
+        .target_repo
+        .clone()
+        .unwrap_or_else(|| layer_target_repo(&quant, &args.target_namespace));
+    let mut model_layer_repos = model_layer_repos(&quants, &args.target_namespace);
+    if !model_layer_repos.contains(&target_repo) {
+        model_layer_repos.push(target_repo.clone());
+    }
     let model_id =
         model_ref::format_gguf_selection_ref(&model.repo_id, &quant.first_file, &quant.name);
 
@@ -887,7 +909,7 @@ fn job_spec_with_token(
     );
     environment.insert("TARGET_REPO".into(), candidate.target_repo.clone());
     environment.insert("MODEL_ID".into(), candidate.model_id.clone());
-    environment.insert("SOURCE_REVISION".into(), "main".into());
+    environment.insert("SOURCE_REVISION".into(), args.source_revision.clone());
     environment.insert("MESH_LLM_REF".into(), args.mesh_llm_ref.clone());
     environment.insert(
         "CATALOG_CREATE_PR".into(),
@@ -897,6 +919,21 @@ fn job_spec_with_token(
     let mut secrets = HashMap::new();
     secrets.insert("HF_TOKEN".into(), hf_token.to_string());
 
+    let mut volumes = vec![JobVolume {
+        volume_type: "bucket".into(),
+        source: "meshllm/layer-split-output".into(),
+        mount_path: "/bucket".into(),
+        read_only: None,
+    }];
+    if args.source_revision == "main" {
+        volumes.push(JobVolume {
+            volume_type: "model".into(),
+            source: candidate.model.repo_id.clone(),
+            mount_path: "/source".into(),
+            read_only: Some(true),
+        });
+    }
+
     Ok(JobSpec {
         docker_image: "ubuntu:22.04".into(),
         command: vec!["bash".into(), "/bucket/split-model-job.sh".into()],
@@ -905,20 +942,7 @@ fn job_spec_with_token(
         secrets,
         flavor: job_plan.flavor.clone(),
         timeout_seconds: job_plan.timeout_seconds,
-        volumes: vec![
-            JobVolume {
-                volume_type: "bucket".into(),
-                source: "meshllm/layer-split-output".into(),
-                mount_path: "/bucket".into(),
-                read_only: None,
-            },
-            JobVolume {
-                volume_type: "model".into(),
-                source: candidate.model.repo_id.clone(),
-                mount_path: "/source".into(),
-                read_only: Some(true),
-            },
-        ],
+        volumes,
     })
 }
 
@@ -1157,7 +1181,7 @@ mod tests {
     }
 
     #[test]
-    fn job_spec_uses_bucket_cache_without_model_volume() {
+    fn job_spec_uses_revisioned_cache_without_model_volume() {
         let candidate = Candidate {
             model: RankedModel {
                 repo_id: "unsloth/GLM-5-GGUF".to_string(),
@@ -1189,12 +1213,15 @@ mod tests {
             flavor: "cpu-upgrade".to_string(),
             timeout_seconds: 43_200,
             mesh_llm_ref: "main".to_string(),
+            source_revision: "3238253553497e969f3144fda297dac98b99dbbe".to_string(),
+            target_repo: None,
             retry_queued_after: Duration::from_secs(1),
             split_candidate_vram_bytes: 8,
             quant_preference: vec!["UD-Q4_K_XL".to_string()],
             wait_for_jobs: true,
             job_poll_interval: Duration::from_secs(60),
             catalog_direct: true,
+            force: false,
             confirm: true,
             dry_run: false,
         };
@@ -1222,18 +1249,23 @@ mod tests {
             Some("UD-Q4_K_XL")
         );
         assert_eq!(
+            spec.environment.get("SOURCE_REVISION").map(String::as_str),
+            Some("3238253553497e969f3144fda297dac98b99dbbe")
+        );
+        assert_eq!(
             spec.environment
                 .get("SOURCE_TOTAL_BYTES")
                 .map(String::as_str),
             Some("401")
         );
-        assert_eq!(spec.volumes.len(), 2);
+        assert_eq!(spec.volumes.len(), 1);
         assert_eq!(spec.volumes[0].volume_type, "bucket");
         assert_eq!(spec.volumes[0].mount_path, "/bucket");
-        assert_eq!(spec.volumes[1].volume_type, "model");
-        assert_eq!(spec.volumes[1].source, candidate.model.repo_id);
-        assert_eq!(spec.volumes[1].mount_path, "/source");
-        assert_eq!(spec.volumes[1].read_only, Some(true));
+        assert!(
+            spec.volumes
+                .iter()
+                .all(|volume| volume.volume_type != "model")
+        );
     }
 
     #[test]
