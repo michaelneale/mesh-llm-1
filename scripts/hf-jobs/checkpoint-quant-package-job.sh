@@ -18,6 +18,7 @@ set -euo pipefail
 #   MESH_LLM_REF             mesh-llm git ref used by downstream package job
 #
 # Optional:
+#   JOB_MODE                 full or conversion-plan, default full
 #   INTERMEDIATE_OUTTYPE     converter output type, default bf16
 #   CONVERT_SPLIT_MAX_SIZE   converter split size, default 48G
 #   GGUF_SUBDIR              subdir in output GGUF repo, default QUANT_TYPE
@@ -38,6 +39,16 @@ require_env() {
 }
 
 require_env HF_TOKEN
+
+JOB_MODE="${JOB_MODE:-full}"
+case "$JOB_MODE" in
+    full|conversion-plan) ;;
+    *)
+        echo "ERROR: unsupported JOB_MODE: $JOB_MODE" >&2
+        echo "Expected one of: full, conversion-plan" >&2
+        exit 1
+        ;;
+esac
 
 SOURCE_REPO="${SOURCE_REPO:-zai-org/GLM-5.1}"
 SOURCE_REVISION="${SOURCE_REVISION:-26e1bd6e011feb778d25ae34b09b07074139d92d}"
@@ -108,6 +119,7 @@ echo "Target GGUF repo:   ${TARGET_GGUF_REPO}"
 echo "Target package:     ${TARGET_PACKAGE_REPO}"
 echo "Quant type:         ${QUANT_TYPE}"
 echo "Mesh LLM ref:       ${MESH_LLM_REF}"
+echo "Job mode:           ${JOB_MODE}"
 storage_snapshot
 
 log_step "Install system dependencies"
@@ -129,17 +141,19 @@ git checkout --detach FETCH_HEAD
 log_step "Prepare patched llama.cpp"
 scripts/prepare-llama.sh pinned
 
-log_step "Build llama.cpp libraries and quantizer"
-scripts/build-llama.sh -DLLAMA_BUILD_TOOLS=ON
-LLAMA_BUILD_DIR="$(scripts/build-llama.sh --print-build-dir)"
-cmake --build "$LLAMA_BUILD_DIR" --config Release --parallel "$(nproc)" --target llama-quantize
-LLAMA_QUANTIZE="${LLAMA_BUILD_DIR}/bin/llama-quantize"
-test -x "$LLAMA_QUANTIZE"
+if [ "$JOB_MODE" = "full" ]; then
+    log_step "Build llama.cpp libraries and quantizer"
+    scripts/build-llama.sh -DLLAMA_BUILD_TOOLS=ON
+    LLAMA_BUILD_DIR="$(scripts/build-llama.sh --print-build-dir)"
+    cmake --build "$LLAMA_BUILD_DIR" --config Release --parallel "$(nproc)" --target llama-quantize
+    LLAMA_QUANTIZE="${LLAMA_BUILD_DIR}/bin/llama-quantize"
+    test -x "$LLAMA_QUANTIZE"
 
-log_step "Build skippy-model-package"
-SKIPPY_LLAMA_BUILD_DIR="$LLAMA_BUILD_DIR" cargo build --release -p skippy-model-package
-SLICER="${CARGO_TARGET_DIR:-${BUILD_DIR}/target}/release/skippy-model-package"
-test -x "$SLICER"
+    log_step "Build skippy-model-package"
+    SKIPPY_LLAMA_BUILD_DIR="$LLAMA_BUILD_DIR" cargo build --release -p skippy-model-package
+    SLICER="${CARGO_TARGET_DIR:-${BUILD_DIR}/target}/release/skippy-model-package"
+    test -x "$SLICER"
+fi
 
 log_step "Prepare Python conversion environment"
 python3 -m venv "${WORK_DIR}/venv"
@@ -178,12 +192,21 @@ PY
 
 log_step "Convert checkpoint to split ${INTERMEDIATE_OUTTYPE} GGUF"
 BF16_OUT="${BF16_DIR}/${GGUF_BASENAME}-${INTERMEDIATE_OUTTYPE}.gguf"
-python .deps/llama.cpp/convert_hf_to_gguf.py \
+CONVERT_ARGS=(
     --remote "$SOURCE_REPO" \
     --outfile "$BF16_OUT" \
     --outtype "$INTERMEDIATE_OUTTYPE" \
     --split-max-size "$CONVERT_SPLIT_MAX_SIZE" \
     --model-name "$MODEL_NAME"
+)
+
+if [ "$JOB_MODE" = "conversion-plan" ]; then
+    python .deps/llama.cpp/convert_hf_to_gguf.py "${CONVERT_ARGS[@]}" --dry-run
+    log_step "Conversion-plan job complete"
+    exit 0
+fi
+
+python .deps/llama.cpp/convert_hf_to_gguf.py "${CONVERT_ARGS[@]}"
 
 BF16_FIRST="$(find "$BF16_DIR" -maxdepth 1 -type f -name '*.gguf' | sort | head -1)"
 if [ -z "$BF16_FIRST" ]; then
