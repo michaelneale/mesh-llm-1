@@ -149,6 +149,33 @@ pip install -q --upgrade pip
 pip install -q -r .deps/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
 pip install -q huggingface_hub hf_xet
 
+log_step "Pin llama.cpp remote conversion to source revision"
+python3 - "$SOURCE_REVISION" <<'PY'
+from pathlib import Path
+import sys
+
+revision = sys.argv[1]
+
+converter = Path(".deps/llama.cpp/convert_hf_to_gguf.py")
+converter_text = converter.read_text()
+old_snapshot = """local_dir = snapshot_download(
+            repo_id=hf_repo_id,
+            allow_patterns=allowed_patterns)"""
+new_snapshot = f"""local_dir = snapshot_download(
+            repo_id=hf_repo_id,
+            revision={revision!r},
+            allow_patterns=allowed_patterns)"""
+if old_snapshot not in converter_text:
+    raise SystemExit("could not find snapshot_download block to patch")
+converter.write_text(converter_text.replace(old_snapshot, new_snapshot))
+
+utility = Path(".deps/llama.cpp/gguf-py/gguf/utility.py")
+utility_text = utility.read_text()
+if "/resolve/main/" not in utility_text:
+    raise SystemExit("could not find remote safetensor resolve path to patch")
+utility.write_text(utility_text.replace("/resolve/main/", f"/resolve/{revision}/"))
+PY
+
 log_step "Convert checkpoint to split ${INTERMEDIATE_OUTTYPE} GGUF"
 BF16_OUT="${BF16_DIR}/${GGUF_BASENAME}-${INTERMEDIATE_OUTTYPE}.gguf"
 python .deps/llama.cpp/convert_hf_to_gguf.py \
