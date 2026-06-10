@@ -28,6 +28,7 @@ set -euo pipefail
 #   TOKEN_EMBEDDING_TYPE     default q8_0
 #   TENSOR_TYPE_OVERRIDES    newline or space separated llama-quantize tensor-type overrides
 #   WORK_ROOT                writable workspace, default /bucket/jianyang-quant-package
+#   JOB_LOCAL_ROOT           local executable/tooling workspace, default /tmp/jianyang-quant-package
 #   PACKAGE_SCRIPT           package script path, default crates/model-package split script
 #   ESTIMATE_COST_PER_HOUR   optional cost rate used in conversion-plan estimate
 
@@ -67,21 +68,28 @@ KEEP_OUTPUT_TENSOR="${KEEP_OUTPUT_TENSOR:-true}"
 TOKEN_EMBEDDING_TYPE="${TOKEN_EMBEDDING_TYPE:-q8_0}"
 TENSOR_TYPE_OVERRIDES="${TENSOR_TYPE_OVERRIDES:-mtp=q8_0 nextn=q8_0}"
 WORK_ROOT="${WORK_ROOT:-/bucket/jianyang-quant-package}"
+JOB_LOCAL_ROOT="${JOB_LOCAL_ROOT:-/tmp/jianyang-quant-package}"
 JOB_ID_SUFFIX="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 WORK_DIR="${WORK_DIR:-${WORK_ROOT}/${JOB_ID_SUFFIX}}"
-BUILD_DIR="${BUILD_DIR:-${WORK_DIR}/mesh-llm}"
+JOB_LOCAL_DIR="${JOB_LOCAL_DIR:-${JOB_LOCAL_ROOT}/${JOB_ID_SUFFIX}}"
+BUILD_DIR="${BUILD_DIR:-${JOB_LOCAL_DIR}/mesh-llm}"
 GGUF_DIR="${GGUF_DIR:-${WORK_DIR}/gguf}"
 BF16_DIR="${BF16_DIR:-${GGUF_DIR}/intermediate-${INTERMEDIATE_OUTTYPE}}"
 QUANT_DIR="${QUANT_DIR:-${GGUF_DIR}/${GGUF_SUBDIR}}"
-HF_HOME="${HF_HOME:-${WORK_DIR}/hf-home}"
+HF_HOME="${HF_HOME:-${JOB_LOCAL_DIR}/hf-home}"
 HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
 HF_XET_CACHE="${HF_XET_CACHE:-${HF_HOME}/xet}"
-TMPDIR="${TMPDIR:-${WORK_DIR}/tmp}"
+TMPDIR="${TMPDIR:-${JOB_LOCAL_DIR}/tmp}"
+VENV_DIR="${VENV_DIR:-${JOB_LOCAL_DIR}/venv}"
+PACKAGE_LOCAL_WORK_DIR="${PACKAGE_LOCAL_WORK_DIR:-${JOB_LOCAL_DIR}/package-local-work}"
+PACKAGE_JOB_WORK_ROOT="${PACKAGE_JOB_WORK_ROOT:-${WORK_DIR}/package-job-work}"
 PACKAGE_SCRIPT="${PACKAGE_SCRIPT:-${BUILD_DIR}/crates/model-package/src/scripts/split-model-job.sh}"
 
 export HF_HOME HF_HUB_CACHE HF_XET_CACHE TMPDIR TEMP="$TMPDIR" TMP="$TMPDIR"
 
-mkdir -p "$WORK_DIR" "$BF16_DIR" "$QUANT_DIR" "$HF_HUB_CACHE" "$HF_XET_CACHE" "$TMPDIR"
+mkdir -p \
+    "$WORK_DIR" "$JOB_LOCAL_DIR" "$BF16_DIR" "$QUANT_DIR" \
+    "$HF_HUB_CACHE" "$HF_XET_CACHE" "$TMPDIR" "$VENV_DIR"
 
 log_step() {
     echo
@@ -184,9 +192,10 @@ PY
 }
 
 storage_snapshot() {
-    echo "Workspace: $WORK_DIR"
-    df -h / /bucket "$WORK_DIR" "$TMPDIR" 2>/dev/null || true
-    du -sh "$WORK_DIR" 2>/dev/null || true
+    echo "Durable workspace: $WORK_DIR"
+    echo "Local workspace:   $JOB_LOCAL_DIR"
+    df -h / /tmp /bucket "$WORK_DIR" "$JOB_LOCAL_DIR" "$TMPDIR" 2>/dev/null || true
+    du -sh "$WORK_DIR" "$JOB_LOCAL_DIR" 2>/dev/null || true
 }
 
 on_error() {
@@ -240,9 +249,9 @@ if [ "$JOB_MODE" = "full" ]; then
 fi
 
 log_step "Prepare Python conversion environment"
-python3 -m venv "${WORK_DIR}/venv"
+python3 -m venv "$VENV_DIR"
 # shellcheck disable=SC1091
-source "${WORK_DIR}/venv/bin/activate"
+source "${VENV_DIR}/bin/activate"
 pip install -q --upgrade pip
 pip install -q -r .deps/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
 pip install -q huggingface_hub hf_xet
@@ -428,8 +437,8 @@ export TARGET_REPO="$TARGET_PACKAGE_REPO"
 export MODEL_ID="$MODEL_ID"
 export MESH_LLM_REF="$MESH_LLM_REF"
 export CATALOG_CREATE_PR="${CATALOG_CREATE_PR:-false}"
-export JOB_WORK_ROOT="${JOB_WORK_ROOT:-${WORK_DIR}/package-job-work}"
-export LOCAL_WORK_DIR="${LOCAL_WORK_DIR:-${WORK_DIR}/package-local-work}"
+export JOB_WORK_ROOT="${JOB_WORK_ROOT:-${PACKAGE_JOB_WORK_ROOT}}"
+export LOCAL_WORK_DIR="${LOCAL_WORK_DIR:-${PACKAGE_LOCAL_WORK_DIR}}"
 
 bash "$PACKAGE_SCRIPT"
 
