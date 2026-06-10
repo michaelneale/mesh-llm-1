@@ -234,7 +234,7 @@ HF_ARGS=(
     --secrets HF_TOKEN
     --label jianyang
     --label phase=1
-    --label model=glm-5.1
+    --label model=glm-5-1
     --label "mode=${JOB_MODE}"
     --env "JOB_MODE=${JOB_MODE}"
     --env "ESTIMATE_COST_PER_HOUR=$(cost_per_hour "$HF_FLAVOR")"
