@@ -29,6 +29,7 @@ set -euo pipefail
 #   TENSOR_TYPE_OVERRIDES    newline or space separated llama-quantize tensor-type overrides
 #   WORK_ROOT                writable workspace, default /bucket/jianyang-quant-package
 #   PACKAGE_SCRIPT           package script path, default crates/model-package split script
+#   ESTIMATE_COST_PER_HOUR   optional cost rate used in conversion-plan estimate
 
 require_env() {
     local name="$1"
@@ -96,6 +97,89 @@ for unit in ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]:
         print(f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} {unit}")
         break
     value /= 1024
+PY
+}
+
+print_conversion_plan_estimate() {
+    log_step "Estimate full quant/package lower bound"
+    python3 - <<'PY'
+from huggingface_hub import HfApi
+import os
+
+source_repo = os.environ["SOURCE_REPO"]
+source_revision = os.environ["SOURCE_REVISION"]
+quant_type = os.environ["QUANT_TYPE"]
+cost_per_hour = os.environ.get("ESTIMATE_COST_PER_HOUR", "")
+
+quant_ratios = {
+    "Q2_K": 0.19,
+    "Q3_K_S": 0.21,
+    "Q3_K_M": 0.23,
+    "Q3_K_L": 0.25,
+    "Q4_K_S": 0.28,
+    "Q4_K_M": 0.31,
+    "Q5_K_M": 0.38,
+    "Q8_0": 0.53,
+}
+
+def fmt_bytes(value: float) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    unit = units[0]
+    for unit in units:
+        if abs(value) < 1024 or unit == units[-1]:
+            break
+        value /= 1024
+    if unit == "B":
+        return f"{int(value)} {unit}"
+    return f"{value:.1f} {unit}"
+
+api = HfApi(token=os.environ.get("HF_TOKEN"))
+info = api.model_info(
+    repo_id=source_repo,
+    revision=source_revision,
+    files_metadata=True,
+)
+
+source_bytes = 0
+for sibling in info.siblings or []:
+    name = getattr(sibling, "rfilename", "")
+    size = getattr(sibling, "size", None)
+    if name.endswith(".safetensors") and size:
+        source_bytes += int(size)
+
+if source_bytes <= 0:
+    print("Could not estimate source safetensor bytes from Hub metadata.")
+    raise SystemExit(0)
+
+ratio = quant_ratios.get(quant_type, 0.30)
+bf16_bytes = source_bytes
+quant_bytes = source_bytes * ratio
+
+# Lower-bound bytes moved by the full path:
+# - conversion reads source safetensors and writes BF16 GGUF
+# - quantization reads BF16 GGUF and writes quant GGUF
+# - GGUF upload reads/uploads quant GGUF
+# - package creation reads quant GGUF and uploads layer artifacts of about the
+#   same order as the quant GGUF
+lower_bound_io = source_bytes + bf16_bytes + bf16_bytes + quant_bytes * 4
+
+print(f"Source safetensor bytes: {fmt_bytes(source_bytes)}")
+print(f"Estimated BF16 intermediate bytes: {fmt_bytes(bf16_bytes)}")
+print(f"Estimated {quant_type} GGUF bytes at ratio {ratio:.2f}: {fmt_bytes(quant_bytes)}")
+print(f"Estimated full-job I/O lower bound: {fmt_bytes(lower_bound_io)}")
+print("This excludes CPU quantization overhead, retries, Hub throttling, and package validation.")
+
+try:
+    rate = float(cost_per_hour) if cost_per_hour else None
+except ValueError:
+    rate = None
+
+for mbps in [25, 50, 100, 200]:
+    hours = lower_bound_io / (mbps * 1000 * 1000) / 3600
+    if rate is None:
+        print(f"At sustained {mbps} MB/s I/O: lower-bound runtime {hours:.1f}h")
+    else:
+        print(f"At sustained {mbps} MB/s I/O: lower-bound runtime {hours:.1f}h, cost ${hours * rate:.2f}")
 PY
 }
 
@@ -202,6 +286,7 @@ CONVERT_ARGS=(
 
 if [ "$JOB_MODE" = "conversion-plan" ]; then
     python .deps/llama.cpp/convert_hf_to_gguf.py "${CONVERT_ARGS[@]}" --dry-run
+    print_conversion_plan_estimate
     log_step "Conversion-plan job complete"
     exit 0
 fi

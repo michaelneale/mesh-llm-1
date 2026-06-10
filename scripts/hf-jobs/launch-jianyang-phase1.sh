@@ -237,6 +237,7 @@ HF_ARGS=(
     --label model=glm-5.1
     --label "mode=${JOB_MODE}"
     --env "JOB_MODE=${JOB_MODE}"
+    --env "ESTIMATE_COST_PER_HOUR=$(cost_per_hour "$HF_FLAVOR")"
     --env "SOURCE_REPO=${SOURCE_REPO}"
     --env "SOURCE_REVISION=${SOURCE_REVISION}"
     --env "QUANT_TYPE=${QUANT_TYPE}"
