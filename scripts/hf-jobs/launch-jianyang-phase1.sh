@@ -255,6 +255,7 @@ HF_ARGS=(
     --env "TENSOR_TYPE_OVERRIDES=${TENSOR_TYPE_OVERRIDES}"
     --env "WORK_ROOT=${WORK_ROOT}"
     --env "CATALOG_CREATE_PR=${CATALOG_CREATE_PR}"
+    --
     "$HF_IMAGE"
     /bin/bash -lc "$BOOTSTRAP"
 )
